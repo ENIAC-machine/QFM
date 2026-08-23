@@ -1,343 +1,221 @@
 import numpy as np
+import scipy.sparse as sps
 import pennylane as qml
 import torch 
 import torch.nn as nn
+import yaml
 
+from scipy.linalg import expm
 from itertools import product 
 from functools import reduce
-
-from scipy.special import factorial
-from scipy.sparse import csr_array
-from scipy.linalg import expm
-
-from typing import Iterable, Generator, Iterator
+from typing import Optional, Iterable
 
 seed = 42
 np.random.seed(seed)
+torch.manual_seed(seed)
 
+DTYPE = torch.complex32
 
-I = np.eye(2, dtype=np.complex64)
-X = np.eye(2, dtype=np.complex64)[::-1]
-Y = np.array([[0, -1j], [1j, 0]], dtype=np.complex64)
-Z = np.array([[1, 0], [0, -1]], dtype=np.complex64)
+# Define Pauli matrices as PyTorch tensors for differentiability
+I = torch.tensor(np.eye(2), dtype=DTYPE)
+X = torch.tensor(np.array([[0, 1], [1, 0]]), dtype=DTYPE)
+Y = torch.tensor(np.array([[0, -1j], [1j, 0]]), dtype=DTYPE)
+Z = torch.tensor(np.array([[1, 0], [0, -1]]), dtype=DTYPE)
 
 
 class QFM():
 
+    '''
+    Implements Quantum Flow Matching algorithm
+    '''
+
     def __init__(self,
                  N: int = 5,
+                 locality: int = 3,
                  M: int = 50,
                  sigma_min: float = 1e-4,
-                 device: str = 'default.qubit'
+                 device: str = 'default.qubit',
+                 n_layers_haar: int | None = None,
+                 U_phi: torch.Tensor | None = None,
+                 init_weights: torch.Tensor | None = None
+                 target_weights: torch.Tensor | None = None
                  ) -> None:
 
-        '''
-
-        '''
-
         kwargs = locals()
-        kwargs.pop('self', None)
+        kwargs.pop('self')
 
         for k, v in kwargs.items():
             setattr(self, k, v)
 
         self.ancilla = 0
-        self.dim = 1 << N
+        self.register = filter(lambda x: True if x != self.ancilla else False,
+                               range(self.N)
+                               )
+        self.dim = 1 << self.N
         self.t = np.random.uniform(0, 1)
-        self.dev = qml.device(device, wires=N)
-        self.delta_t = 1 / M
+        # We need N+1 wires for the Hadamard test (1 ancilla + N system)
+        self.dev = qml.device(device, wires=self.N + 1)
+        self.delta_t = 1 / self.M
 
-    
-    def create_Hamiltonian(locality: int,
-                           params: str = 'random'
-                           ) -> Generator[tuple(int, Iterator),
-                                          Iterable,
-                                          tuple(csr_array, Iterable)]:
-    
+        self.H_train = self.create_Hamiltonian()
+
+        self.target_weights = torch.randn(size=self.weights) if self.target_weights is None\
+                else self.target_weights 
+
+        self.H_target = self.create_Hamiltonian(weights=self.target_weights)
+
+    def Haar_sample(self,
+                    n_layers: int | None = None
+                    ) -> np.ndarray:
         '''
-        Creates a parametrised Hamiltonian operator out of Pauli strings
+        Samples from Haar dist
         '''
 
-        conversion = {'I' : I,
-                  'X' : X,
-                  'Z' : Z,
-                  'Y' : Y}
+        if self.n_layers_haar is not None:
+            n_layers = self.n_layers_haar
 
-        assert locality <= n_qubits, 'locality must be less or equal than the number of qubits'
-        
-        #make combinations of Pauli strings that will be used for Hamiltonian like XIX for locality=2
-        combs = map(lambda x: (conversion[x_i] for x_i in x),
-                    filter(lambda x: False if ''.join(x).count('I') != n_qubits - locality else True,
-                       product(*[('I', 'X', 'Z', 'Y') for i in range(n_qubits)])
+        ttl_wires = filter(lambda x: True if x != self.ancilla else False,
+                           range(self.N)
                            )
-                    )
-        
-        #make it a csr array cause memory
-        Hamiltonian = csr_array(np.zeros((1 << n_qubits, 1 << n_qubits), dtype=np.complex64))
-        
-        #random params
-        if params == 'random':
 
-            weights = []
-            for comb in combs:
-                weight = np.random.rand()
-                Hamiltonian: csr_array = Hamiltonian + csr_array(weight * reduce(np.kron, comb))
-                weights.append(weight)
-        
-        elif params == 'custom':
-        
-            len_weights = sum(1 for _ in combs)
+        for idl in range(n_layers):
 
-            weights = yield len_weights, combs 
-            
-            for comb, weight in zip(combs, weights, strict=True):
-                Hamiltonian: csr_array = Hamiltonian + csr_array(weight * reduce(np.kron, comb))
+            for i, w in enumerate(ttl_wires):
+                qml.RX(np.random.rand(), wires=w)
+                qml.RY(np.random.rand(), wires=w)
+                qml.RZ(np.random.rand(), wires=w)
+                
+            n_combs = (self.N - 1) * (self.N - 2)  /  2
 
-
-        return Hamiltonian, weights
-
-    @staticmethod
-    def Haar(n_layers: int) -> qml.measurements.state.StateMP:
-
-
-        #reset all
-        for wire in range(1, N):
-            qml.measure(wires=wire, reset=True)
-
-        if depth is None:
-            depth = 4*N
-
-        for d in range(depth):
-            
-            # we leave out the ancilla
-            for q in range(1, N):
-                qml.U3(*params[d, q], wires=q)
-            
-            # we leave out the ancilla
-            for q in range(1, N - 1):
-                qml.CNOT(wires=[q, q + 1])
-        
-            # we leave out the ancilla
-            for q in range(1, N):
-                qml.U3(*params[depth, q], wires=q)
+            for id_pair, (i, j) in enumerate(combinations(ttl_wires, 2)):
+                qml.IsingZZ(params[idl, (self.N - 1)*3 + id_pair], wires=[i, j])
 
         return qml.state()
 
-
-    @staticmethod
-    @qml.qnode(device)
-    def Find_angles() -> Iterator[int]:
-
-        #reset all
-        for wire in range(N):
-            qml.measure(wires=wire, reset=True)
-
-        qml.Hadamard(wires=ancilla)
-
-        qml.ctrl(qml.QubitUnitary, control=ancilla)(U_target, wires=range(1, N))
-
-        qml.Hadamard(wires=ancilla)
-
-        #Re
-        yield qml.expval(qml.Z(ancilla))
-
-        for wire in range(N):
-            qml.measure(wires=wire, reset=True)
-
-        qml.Hadamard(wires=ancilla)
-
-        qml.ctrl(qml.QubitUnitary, control=ancilla)(U_target, wires=range(1, N))
-
-        qml.adjoint(qml.S)(wires=ancilla)
-
-        qml.Hadamard(wires=ancilla)
-
-        #Im
-        yield qml.expval(qml.Z(ancilla))
-
-
-    def _get_weights_for_lin_comb(self,
-                                  *args
-                                  ) -> tuple(float, float, complex):
+    def inner_prod(self,
+                   U_psi: torch.Tensor,
+                   U_phi: torch.Tensor,
+                   im: bool = False,
+                   ) -> float:
 
         '''
-        Given the Real and Imaginary parts of the inner product of $psi_1$ and $psi_0$,
-        which are the state vectors that are induces by their respective unitary operators,
-        we can find the weights to use to find a linear combination of $psi_1$ and $psi_2$ projected
-        onto the non-euclidean (geodesic) plane (bloch-sphere for 1 qubit case)
+        Circuit to calculate the inner prod of two vectors induced by arbitrary unitaries
         '''
 
-        phase = np.arctan2(args[0], args[1])
+        qml.Hadamard(self.ancilla)
 
-        inner_prod = complex(args[0], args[1])
+        qml.QubitUnitary(U_phi.H,
+                         wires=filter(lambda x: True if x != self.ancilla else False,
+                                      range(self.N)
+                                      )
+                         )
 
-        a = np.cos(np.arccos(np.abs(inner_prod)) * self.t)
-        b = np.sin(np.arccos(np.abs(inner_prod)) * self.t) * phase
+        qml.QubitUnitary(U_psi,
+                         wires=filter(lambda x: True if x != self.ancilla else False,
+                                      range(self.N)
+                                      )
+                         )
 
-        return a, b, phase
+        if im:
+            qml.S(wires=self.ancilla)
 
+        qml.Hadamard(wires=self.ancilla)
 
-    def _get_orthogonal_vectors(a: float,
-                                b: float,
-                                phase: complex
-                                ) -> np.ndarray:
+        return qml.expval(qml.PauliZ(wires=self.ancilla))
 
-        '''
-        Given the weights for the lin. combo and the phase find the $psi_t$
-        '''
+    def create_Hamiltonian(self,
+                            locality: int | None = None,
+                            weights: torch.Tensor | None = None
+                            ) -> torch.Tensor:
+        """Creates a parametrised Hamiltonian operator out of Pauli strings."""
 
-        e0 = 
+        if locality is None:
+            locality = self.locality
 
-
-#==================================================
-#==================================================
-
-
-
-
-
-
-
-
-
-
-N = 5 #number of qubits
-assert (N - 1) % 2 == 0, 'The number of qubits in total should be equal to 2*n + 1'
-M = 50 #number of steps
-sigma_min = 1e-4 #min variance for the flow
-
-ancilla = 0
-reg0 = np.arange(1, (N - 1) // 2)
-reg1 = np.arange((N - 1) // 2, N+1)
-dim = 1 << N
-t = np.random.uniform(0, 1)
-
-device = qml.device('default.qubit', wires=N)
-
-I = np.eye(2, dtype=np.complex64)
-X = np.eye(2, dtype=np.complex64)[::-1]
-Y = np.array([[0, -1j], [1j, 0]], dtype=np.complex64)
-Z = np.array([[1, 0], [0, -1]], dtype=np.complex64)
-
-
-def create_Hamiltonian(n_qubits: int,
-                       locality: int
-                       ) -> tuple(csr_array, list[float]):
-
-    conversion = {'I' : I,
-                  'X' : X,
-                  'Z' : Z,
-                  'Y' : Y}
-
-
-    assert locality <= n_qubits, 'locality must be less than the number of qubits'
-
-    '''
-    Creates a parametrised Hamiltonian operator out of Pauli strings
-    '''
-
-    combs = map(lambda x: (conversion[x_i] for x_i in x),
-                filter(lambda x: False if ''.join(x).count('I') != n_qubits - locality else True,
-                   product(*[('I', 'X', 'Z', 'Y') for i in range(n_qubits)])
+        conversion = {'I' : I, 'X' : X, 'Z' : Z, 'Y' : Y}
+       
+        combs = filter(lambda x: True if x.count('I') == (self.N - locality) else False,
+                       product(conversion.keys(), repeat=self.N)
                        )
-                )
+
+        if weights is None:
+            if self.weights is None:
+                weights = map(lambda x: np.random.rand(), combs)
+                self.weights = weights
+            else:
+                weights = self.weights
+
+        for idx, (comb, w) in enumerate(zip(combs, weights)):
+            mat: torch.Tensor = reduce(sps.kron,
+                                       map(lambda x: sps.csr_matrix(conversion[x].detach().cpu().to(complex).numpy()),
+                                                     comb
+                                           )
+                                       )
+            
+            if idx == 0:
+                Hamiltonian = w * mat 
+            else:
+                Hamiltonian += w * mat
+
+        return torch.sparse_csr_tensor(
+                torch.from_numpy(Hamiltonian.indptr),
+                torch.from_numpy(Hamiltonian.indices),
+                torch.from_numpy(Hamiltonian.data),
+                size=Hamiltonian.shape
+                ).to(DTYPE)
+
+    def geodesic_operator(v_a: complex,
+                          v_b: complex,
+                          coeffs: tuple(complex) = None
+                          ) -> sps.csr_array:
+        '''
+        H such that expm(-1j*H*t) @ v_a goes from |psi_a> (t=0) to the
+        NORMALIZED combination coeffs[0]*|psi_a> + coeffs[1]*|psi_b> (t=1).
+        coeffs=None -> Fubini-Study geodesic of eqs. (3)-(4).
+        '''
+
+        #zero = sps.csr_array(shape=(U_a.shape[0], 1))
+        #zero[0] = 1
+
+        #We know U_a and U_b canonically, so it's easy, we'll have to simulate that anyway
+        #v_a, v_b = U_a @ zero, U_b @ zero
+
+        c = np.vdot(v_a, v_b)
+        mod = abs(c)
+        alpha = np.arccos(np.clip(mod, -1, 1))
+        beta = np.angle(c)
+        e1 = (v_b - c * v_a) / np.sqrt(1 - mod**2)          # eq. (2)
+
+        if coeffs is None:   # geodesic endpoint of eq. (3) at t=1
+            w0 = np.cos(alpha) - np.sin(alpha)*np.exp(1j*beta)*c/np.sqrt(1 - mod**2)
+            w1 = np.sin(alpha)*np.exp(1j*beta)/np.sqrt(1 - mod**2)
+        else:
+            w0, w1 = coeffs
+
+        target = w0*v_a + w1*v_b
+        norm   = np.linalg.norm(target)
+        if norm < 1e-12:
+            raise ValueError("coefficients give (almost) the zero vector")
+        target /= norm
+
+        # coordinates of target in orthonormal basis {|e0>, |e1>}
+        u0 = np.vdot(v_a, target)
+        u1 = np.vdot(e1,  target)
+
+        ref   = np.angle(u0) if abs(u0) > 1e-12 else np.angle(u1)  # global phase
+        a1    = u1*np.exp(-1j*ref)                                 # a0 = |u0| real >= 0
+        theta = np.arctan2(abs(u1), abs(u0))                       # rotation angle
+        phi   = np.angle(a1) if abs(a1) > 1e-12 else 0.0           # relative phase
+
+        f = np.exp(1j*phi)*e1
+        H = 1j*theta*(np.outer(f, v_a.conj()) - np.outer(v_a, f.conj()))  # eq. (4) form
+        H -= ref*np.eye(len(v_a))    # restores the exact global phase
+        return H
     
-    Hamiltonian = csr_array(np.zeros((1 << n_qubits, 1 << n_qubits), dtype=np.complex64))
-    params = []
-    for comb in combs:
-        param = np.random.rand()
-        Hamiltonian: csr_array = Hamiltonian + csr_array(param * reduce(np.kron, comb))
-        params.append(param)
+    @qml.qnode(dev=self.device)
+    def forward(x: torch.Tensor) -> torch.Tensor:
+   
 
-
-    return Hamiltonian, params
-
-
-@qml.qnode(device)
-def Haar(depth: int | None = None) -> None:
-
-    #reset all
-    for wire in range(1, N):
-        qml.measure(wires=wire, reset=True)
-
-    if depth is None:
-        depth = 4*N
-
-    for d in range(depth):
         
-        # we leave out the ancilla
-        for q in range(1, N):
-            qml.U3(*params[d, q], wires=q)
-        
-        # we leave out the ancilla
-        for q in range(1, N - 1):
-            qml.CNOT(wires=[q, q + 1])
-    
-        # we leave out the ancilla
-        for q in range(1, N):
-            qml.U3(*params[depth, q], wires=q)
 
-    return qml.state()
-
-Hamiltonian, params = create_Hamiltonian(3, 2)
-
-delta_t = 1 / M
-
-U_target = expm(-1j*delta_t*Hamiltonian)
-
-Hamiltonian, params = create_Hamiltonian(3, 2)
-
-Hamiltonian_dagger = Hamiltonian.conj().T
-
-@qml.qnode(device)
-def Find_angles():
-
-    #reset all
-    for wire in range(N):
-        qml.measure(wires=wire, reset=True)
-
-    qml.Hadamard(wires=ancilla)
-
-    qml.ctrl(qml.QubitUnitary, control=ancilla)(U_target, wires=range(1, N))
-
-    qml.Hadamard(wires=ancilla)
-
-    #Re
-    yield qml.expval(qml.Z(ancilla))
-
-    for wire in range(N):
-        qml.measure(wires=wire, reset=True)
-
-    qml.Hadamard(wires=ancilla)
-
-    qml.ctrl(qml.QubitUnitary, control=ancilla)(U_target, wires=range(1, N))
-
-    qml.adjoint(qml.S)(wires=ancilla)
-
-    qml.Hadamard(wires=ancilla)
-
-    #Im
-    yield qml.expval(qml.Z(ancilla))
-
-    
-def _get_weights_for_lin_comb(*args):
-
-    phase = np.arctan2(args[0], args[1])
-
-    inner_prod = complex(args[0], args[1])
-
-    a = np.cos(np.abs(inner_prod) * t)
-    b = np.sin(np.arccos(np.abs(inner_prod)) * t) * phase
-
-    return a, b
-
-U_train = expm(-1j*delta_t*Hamiltonian)
-
-@qml.qnode(device)
-def train():
-
-    for wire in range(N):
-        qml.measure(wire=wire, reset=True)
-
-    #prepare target state
-    qml.QubitUnitary(U_target, wires=range(1, N))
+       

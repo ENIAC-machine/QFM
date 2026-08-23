@@ -20,18 +20,18 @@ $\mathcal{W}_k$ - the set of all operators that comprise the hamiltonian operato
 
 ## Algorithm
 
+footnotes: we first construct the states, find the angle between the states
+
 **Input:** A unitary operator $U_{dist, i}$ , $\sigma_{min}$, M
 
-**Output:** Gradient $\nabla \mathrm{H}(\theta, t)$
+**Output:** Gradient $\nabla \mathrm{H}(\theta)$
 
-1. Sample t \~ Uniform[0, 1/M] classically, set $\Delta t = \frac{1}{M}$
+1. Sample t \~ Uniform[0, 1]
 
-2. Prepare a state $\ket{\psi_1}' := t\ket{\psi_1} + ((1-t)+t\sigma_{min})\ket{\psi_0}$
+2. Find Inner prod (Re) of $U_{target}$ and $U_{Haar}$
 
-3. Prepare a time evolution operator $U(\Delta t; \theta) = exp(-i\Delta t\sum_jc_j(\theta)P_j)$, where $P_j$ is a tensor prod of pauli strings
+3. Find geodesic interpolation of $U_{target}$ and $U_{Haar}$ with weights t and (1-t)
 
-4. Find $\ket{\hat\psi_{t+\Delta t}} = U(\Delta t; \theta) \ket{\psi_1}'$
+4. Find inner prod (Re) of $U_\theta$ and $U_{Haar}$ 
 
-5. Find $\ket{\psi_{t+\Delta t}} = \frac{(t + \Delta t)*\ket{\psi_1} + ((1-t - \Delta t)+(t + \Delta t)\sigma_{min})\ket{\psi_0}}{||(t + \Delta t)*\ket{\psi_1} + ((1-t - \Delta t)+(t + \Delta t)\sigma_{min})\ket{\psi_0}||} $
-
-6. Compute $2 + 2Re(\braket{\psi_{t+\Delta t}|\hat\psi_{t+\Delta t}})$ via the SWAP test
+5. Compute Loss $2 + 2Re(\braket{\psi_{t+\Delta t}|\hat\psi_{t+\Delta t}})$ via the SWAP test and run backprop
