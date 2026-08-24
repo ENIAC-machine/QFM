@@ -1,0 +1,13 @@
+.*/
+.*
+!.gitignore
+check_for_alpha_beta.py
+geodesic.py
+LCUs.py
+test_LCU.py
+test.py
+train.py
+qfm.py
+test_angles.py
+config.yaml
+__pycache__
