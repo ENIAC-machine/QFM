@@ -11,3 +11,5 @@ qfm.py
 test_angles.py
 config.yaml
 __pycache__
+__init__.py
+hamiltonian_weights.pth
