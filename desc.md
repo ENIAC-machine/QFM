@@ -28,10 +28,8 @@ footnotes: we first construct the states, find the angle between the states
 
 1. Sample t \~ Uniform[0, 1]
 
-2. Find Inner prod (Re) of $U_{target}$ and $U_{Haar}$
+2. Find geodesic interpolation of $U_{target}$ and $U_{Haar}$ with weights t and (1-t)
 
-3. Find geodesic interpolation of $U_{target}$ and $U_{Haar}$ with weights t and (1-t)
+3. Find inner prod (Re) of $U_\theta$ and the geodesic interpolation (condition t by encoding it into the ancilla)
 
-4. Find inner prod (Re) of $U_\theta$ and $U_{Haar}$ 
-
-5. Compute Loss $2 + 2Re(\braket{\psi_{t+\Delta t}|\hat\psi_{t+\Delta t}})$ via the SWAP test and run backprop
+4. Compute Loss $2 + 2Re(\braket{\psi_{t+\Delta t}|\hat\psi_{t+\Delta t}})$ via the SWAP test and run backprop
