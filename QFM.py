@@ -7,10 +7,12 @@ import torch.optim as optim
 import matplotlib.pyplot as plt
 import yaml
 
+
+from torch.utils.data import Dataset, DataLoader
 from scipy.linalg import expm
 from itertools import product, combinations
 from functools import reduce
-from typing import Optional, Iterable, Callable
+from typing import Optional, Iterable, Callable, Sequence
 from math import comb
 from tqdm import tqdm
 
@@ -27,6 +29,28 @@ Y = torch.tensor(np.array([[0, -1j], [1j, 0]]), dtype=DTYPE)
 Z = torch.tensor(np.array([[1, 0], [0, -1]]), dtype=DTYPE)
 
 
+class Unitary_Dataset(Dataset):
+
+    '''
+    Custom dataset to hold unitary operators for some dist,
+    can be initialized from a list of csr_arrays
+    Yes, they gotta be csr_arrays
+    '''
+
+    def __init__(self,
+                 arr: Sequence[sps.csr_array]
+                 ) -> None:
+        self.items = arr 
+
+    def __len__(self):
+        return self.items.__len__()
+
+    def __getitem__(self,
+                    idx: int
+                    ) -> sps.csr_array:
+        return self.items[idx]
+
+
 class QFM(nn.Module):
 
     '''
@@ -35,6 +59,7 @@ class QFM(nn.Module):
 
     def __init__(self,
                  N: int = 5,
+                 ancillas: Sequence[int] = (0, 1),
                  locality: int = 3,
                  sigma_min: float = 1e-4,
                  device: str = 'default.qubit',
@@ -42,6 +67,9 @@ class QFM(nn.Module):
                  init_weights: torch.Tensor | None = None,
                  target_weights: torch.Tensor | None = None
                  ) -> None:
+
+        assert len(ancillas) < N,\
+                "The total number of ancillas must be less than the total number of qubits"
 
         super().__init__()
 
@@ -51,218 +79,204 @@ class QFM(nn.Module):
         self.device_name = device
         self.n_layers_haar = n_layers_haar
         
-        self.ancilla = 0
-        self.register = [x for x in range(self.N + 1) if x != self.ancilla]
+        self.ancillas = ancillas
+        self.ancilla_Hadamard = ancillas[0] #ancilla for the Hadamard test
+        self.ancilla_LCU = ancillas[1] #ancilla for the LCU
+        self.register = [x for x in range(self.N + 1) if x not in self.ancillas]
         self.dim = 1 << self.N
         
-        # We need N+1 wires for the Hadamard test (1 ancilla + N system)
         self.dev = qml.device(self.device_name, wires=self.N + 1)
         
         # Calculate the number of Pauli terms with specific locality
-        self.num_terms = comb(self.N, self.locality) * (3 ** self.locality)
+        self.num_terms = comb(len(self.register), self.locality) * (3 ** self.locality)
         
-        # Initialize weights as nn.Parameter for PyTorch compatibility
+        #init weights for H_theta
         if init_weights is None:
             self.weights = nn.Parameter(torch.randn(self.num_terms, dtype=torch.float32))
         else:
             self.weights = nn.Parameter(init_weights)
-            
+        
         self.H_train = self.create_Hamiltonian(weights=self.weights)
         
+        '''
+        #weights for H_target
         if target_weights is None:
             self.target_weights = torch.randn(self.num_terms, dtype=torch.float32)
         else:
             self.target_weights = target_weights
             
         self.H_target = self.create_Hamiltonian(weights=self.target_weights)
+        '''
+        
+        #create target dataset
+        self.dataset = self.create_target_dataset()
 
-        # Precompute U_target and U_Haar unitaries (fixed during training)
-        # torch.matrix_exp is used instead of scipy.linalg.expm to maintain the computational graph
-        H_target_dense = self.H_target.to(torch.complex64)
         H_train_dense = self.H_train.to(torch.complex64)
         
-        self.U_target = torch.matrix_exp(-1j * H_target_dense).detach()
         self.U_haar = torch.matrix_exp(-1j * H_train_dense).detach()
         
         # |0> state
         self.zero_state = torch.zeros(self.dim, dtype=torch.complex64)
         self.zero_state[0] = 1.0
-        
-        # Prior and Target states
-        self.v_a = self.U_target @ self.zero_state
-        self.v_b = self.U_haar @ self.zero_state
-        
-        # Precompute geodesic operator (generator of the Fubini-Study geodesic)
-        # coeffs=None gives the true geodesic path between v_a and v_b
-        v_a_np = self.v_a.detach().cpu().numpy()
-        v_b_np = self.v_b.detach().cpu().numpy()
-        H_geo_np = self.geodesic_operator(v_a_np, v_b_np, coeffs=None)
-        self.H_geodesic = torch.tensor(H_geo_np, dtype=torch.complex64)
-        
-        # Compile the QNode once during initialization
+       
+        # Compile the circuit 
         self.circuit = self.get_qnode()
 
     def Haar_sample(self,
                     n_layers: int | None = None
                     ) -> np.ndarray:
-
-        ''' Samples from Haar dist '''
-        if self.n_layers_haar is not None:
-            n_layers = self.n_layers_haar
-
-        ttl_wires = [x for x in range(self.N + 1) if x != self.ancilla]
+        '''
+        Samples from (kinda) Haar dist. Kinda the scrambling circuit from that QFM paper
         
-        # Random parameters for the Haar random circuit
+        Inputs:
+            n_layers: int - number of layers in the scrambilng circuit  
+
+        Outputs:
+           state of the system as a numpy ndarray 
+        '''
+
+        if n_layers is None:
+            n_layers = self.n_layers_haar
+        elif self.n_layers_haar is None:
+            raise ValueError('The number of layers should be present either upon initialization of the class or the function call')
+
         n_combs = (self.N * (self.N - 1)) // 2
         params = np.random.rand(n_layers, self.N * 3 + n_combs)
 
         for idl in range(n_layers):
-            for i, w in enumerate(ttl_wires):
+            for i, w in enumerate(self.register):
                 qml.RX(params[idl, i*3], wires=w)
                 qml.RY(params[idl, i*3+1], wires=w)
                 qml.RZ(params[idl, i*3+2], wires=w)
                 
-            for id_pair, (i, j) in enumerate(combinations(ttl_wires, 2)):
+            for id_pair, (i, j) in enumerate(combinations(self.register, 2)):
                 qml.IsingZZ(params[idl, self.N*3 + id_pair], wires=[i, j])
 
         return qml.state()
 
-    def inner_prod(self,
-                   U_psi: torch.Tensor,
-                   U_phi: torch.Tensor,
-                   im: bool = False
-                   ) -> float:
-        '''
-        Circuit to calculate the real part of the inner prod of two vectors 
-        induced by arbitrary unitaries using the Hadamard test.
-        '''
-        qml.Hadamard(self.ancilla)
-
-        # Controlled-U_phi^dagger
-        qml.ctrl(qml.QubitUnitary, control=self.ancilla)(U_phi.conj().T, wires=self.register)
-
-        # Controlled-U_psi
-        qml.ctrl(qml.QubitUnitary, control=self.ancilla)(U_psi, wires=self.register)
-
-        if im:
-            qml.S(wires=self.ancilla)
-
-        qml.Hadamard(wires=self.ancilla)
-
-        return qml.expval(qml.PauliZ(wires=self.ancilla))
-
     def create_Hamiltonian(self,
                            weights: torch.Tensor
                            ) -> torch.Tensor:
-        """Creates a parametrised Hamiltonian operator out of Pauli strings."""
+        '''
+        Creates a parametrised Hamiltonian operator out of scaled Pauli strings
+        H = \sum_{i=1}^{n} alpha_i * S_i , where S_i can be S_i = I \otimes X \otimes I
+        '''
+        
         conversion = {'I' : I, 'X' : X, 'Z' : Z, 'Y' : Y}
-       
-        combs = list(filter(lambda x: x.count('I') == (self.N - self.locality),
-                            product(['I', 'X', 'Y', 'Z'], repeat=self.N)))
+        
+        combs = list(
+                    filter(lambda x: x.count('I') == (len(self.register) - self.locality),
+                           product(['I', 'X', 'Y', 'Z'], repeat=len(self.register))
+                           )
+                )
         
         # Build dense tensors directly to maintain the PyTorch computational graph 
         # for torch.matrix_exp, which does not support sparse matrices.
-        dim = 1 << self.N
+        dim = 1 << len(self.register)
         H = torch.zeros((dim, dim), dtype=DTYPE)
-        
+       
         for idx, (comb, w) in enumerate(zip(combs, weights)):
             mat = reduce(torch.kron, map(lambda x: conversion[x], comb))
             H = H + w * mat
 
         return H
 
-    @staticmethod
-    def geodesic_operator(v_a: np.ndarray,
-                          v_b: np.ndarray,
-                          coeffs: tuple = None
-                          ) -> np.ndarray:
-        '''
-        H such that expm(-1j*H*t) @ v_a goes from |psi_a> (t=0) to the
-        NORMALIZED combination coeffs[0]*|psi_a> + coeffs[1]*|psi_b> (t=1).
-        coeffs=None -> Fubini-Study geodesic.
-        '''
-        c = np.vdot(v_a, v_b)
-        mod = abs(c)
+    def create_target_dataset(self, size: int = 1_000) -> Unitary_Dataset:
+        target_weights = torch.randn((self.num_terms,), dtype=torch.float32)
+        self.H_target = self.create_Hamiltonian(weights=target_weights)
         
-        # Safety cap to avoid NaNs in sqrt/arccos if states are parallel/anti-parallel
-        if mod >= 1.0:
-            mod = 0.9999999
+        unitaries = []
+        for i in range(size):
+            target_weights[0] = torch.rand((1,))
+            unitaries.append(self.create_Hamiltonian(weights=target_weights))
+        return Unitary_Dataset(unitaries) 
 
-        alpha = np.arccos(np.clip(mod, -1, 1))
-        beta = np.angle(c)
-        e1 = (v_b - c * v_a) / np.sqrt(1 - mod**2)          # eq. (2)
+    def geodesic(self,
+                 t: torch.Tensor, #tensor of 1 value
+                 U_psi: np.ndarray,
+                 U_phi: np.ndarray,
+                 delta: float = .0,
+                 conj_t: bool = False
+                 ) -> None:
+        '''
+        LCU for constant-speed geodesic with weights t and t-1 for U_psi and U_phi respectively
 
-        if coeffs is None:   # geodesic endpoint of eq. (3) at t=1
-            w0 = np.cos(alpha) - np.sin(alpha)*np.exp(1j*beta)*c/np.sqrt(1 - mod**2)
-            w1 = np.sin(alpha)*np.exp(1j*beta)/np.sqrt(1 - mod**2)
-        else:
-            w0, w1 = coeffs
+        Inputs:
+            t - weight
+            U_psi - the initial unitary (Haar in our case)
+            U_phi - the target unitary (from target dist)
+            delta - phase alignment value, if states have overlap <psi|phi> = |c|e^{i*delta},
+            we need to apply exp(-i*delta)
+            conj_t - whether we need the conjugate transpose of the Unitary obtained
+                via LCU, defaults to False
+        '''
 
-        target = w0*v_a + w1*v_b
-        norm   = np.linalg.norm(target)
-        if norm < 1e-12:
-            raise ValueError("coefficients give (almost) the zero vector")
-        target /= norm
+        theta = 2 * torch.arcsin(torch.sqrt(t))
 
-        # coordinates of target in orthonormal basis {|e0>, |e1>}
-        u0 = np.vdot(v_a, target)
-        u1 = np.vdot(e1,  target)
-
-        ref   = np.angle(u0) if abs(u0) > 1e-12 else np.angle(u1)  # global phase
-        a1    = u1*np.exp(-1j*ref)                                 # a0 = |u0| real >= 0
-        theta = np.arctan2(abs(u1), abs(u0))                       # rotation angle
-        phi   = np.angle(a1) if abs(a1) > 1e-12 else 0.0           # relative phase
-
-        f = np.exp(1j*phi)*e1
-        H = 1j*theta*(np.outer(f, v_a.conj()) - np.outer(v_a, f.conj()))  # eq. (4) form
-        H -= ref*np.eye(len(v_a))    # restores the exact global phase
-        return H
+        ops = [
+                qml.RY(theta, wires=self.ancilla_LCU),
+                qml.ctrl(
+                    qml.QubitUnitary(U_psi, wires=self.register), 
+                    control=self.ancilla_LCU, control_values=0
+                    ),
+                qml.ctrl(
+                    qml.QubitUnitary(U_phi, wires=self.register), 
+                    control=self.ancilla_LCU, control_values=1
+                    ),
+    ]
     
+        if delta != .0:
+            ops.append(qml.RZ(-delta, wires=self.ancilla_LCU))
+            
+        ops.append(qml.RY(-theta, wires=self.ancilla_LCU))
+
+        #reverse operations for the conjugate transpose case
+        for op in ops[::1-2*conj_t]:
+            qml.apply(op)
+
     def get_qnode(self) -> Callable:
         
         @qml.qnode(self.dev, interface='torch')
         def circuit(t: float | torch.Tensor,
+                    U_target: sps.csr_array,
                     weights : torch.Tensor
                     ) -> float:
-            t_val = t.item() if isinstance(t, torch.Tensor) else t
+
+            t_val = torch.Tensor([t]) if isinstance(t, float) else t
             
-            # 1. Geodesic interpolation (evolve v_a with H_geodesic for time t)
-            U_geodesic = torch.matrix_exp(-1j * self.H_geodesic * t_val).to(DTYPE)
-            
-            # 2. Evolution operator for U_theta (parametrized Hamiltonian)
+            # 1. Evolution operator for U_theta (parametrized Hamiltonian)
             H_theta = self.create_Hamiltonian(weights=weights)
             H_theta_dense = H_theta.to(DTYPE)
             U_theta = torch.matrix_exp(-1j * H_theta_dense * t_val)
+           
+            #2. Start from noise 
+            qml.QubitUnitary(self.U_haar, wires=self.register)
+
+            #3. Inner product (Re) via Hadamard Test (Fixed with qml.ctrl) to get denoising quality
+            qml.Hadamard(wires=self.ancilla_Hadamard)
+           
+            #Apply controlled U_theta
+            qml.ctrl(qml.QubitUnitary, control=self.ancilla_Hadamard)(U_theta.to(DTYPE), wires=self.register)
+           
+            #Apply the conjugate transpose of the operator that induces geodesic interpolation
+            self.geodesic(t_val, self.U_haar, U_target, conj_t=True)
+
+            qml.Hadamard(wires=self.ancilla_Hadamard)
             
-            # The target state at time  is |psi_t> = U_geodesic * U_target |0>
-            U_psi = U_geodesic @ self.U_target.to(DTYPE)
-            
-            # 3. Inner product (Re) via Hadamard Test (Fixed with qml.ctrl)
-            qml.Hadamard(wires=self.ancilla)
-            
-            # Apply controlled U_theta
-            qml.ctrl(qml.QubitUnitary, control=self.ancilla)(U_theta.to(DTYPE), wires=self.register)
-            
-            # Apply controlled U_psi^dagger
-            qml.ctrl(qml.QubitUnitary, control=self.ancilla)(U_psi.conj().T, wires=self.register)
-            
-            qml.Hadamard(wires=self.ancilla)
-            
-            return qml.expval(qml.PauliZ(wires=self.ancilla))
+            #Всё
+            return qml.expval(qml.PauliZ(wires=self.ancilla_Hadamard))
             
         return circuit
 
-    def forward(self, x: Optional[torch.Tensor] = None) -> torch.Tensor:
-        '''
-        x isn't actually used here cause we try to approx a target hamiltonian but I left 
-        for forward compatibility and yada yada
-        '''
+    def forward(self,
+                x: sps.csr_array
+                ) -> torch.Tensor:
 
         # Sample t ~ Uniform[0, 1]
         t = torch.rand(1)
         
         # Find inner prod (Re) of U_theta and the geodesic interpolation
-        inner_prod = self.circuit(t, self.weights)
+        inner_prod = self.circuit(t, x, self.weights)
         
         # Compute Loss the inner prod above
         loss = inner_prod
@@ -274,7 +288,8 @@ def train_qfm(num_epochs: int = 200,
               batch_size: int = 8,
               lr: float = 0.05,
               N: int = 3,
-              locality: int = 2
+              locality: int = 2,
+              shuffle: bool = True
               ):
     """
     Sample training script for the Quantum Flow Matching (QFM) model.
@@ -298,17 +313,19 @@ def train_qfm(num_epochs: int = 200,
     
     print(f"Starting training for {num_epochs} epochs with batch_size={batch_size}...")
     print("Note: The theoretical minimum loss is 0.0 (states match up to a global phase).\n")
-    
+
+    dataloader = DataLoader(model.dataset, batch_size=batch_size, shuffle=shuffle)
+
     # 4. Training loop
     for epoch in tqdm(range(num_epochs), desc="Training"):
         optimizer.zero_grad()
         
         # Accumulate gradients over a mini-batch of random time samples 't'
         batch_loss = 0.0
-        for _ in range(batch_size):
+        for batch in dataloader:
             # Forward pass samples a random t ~ U[0,1] internally
-            loss = model.forward()
-            batch_loss += loss
+            loss = model.forward(batch).sum()**2
+            batch_loss += loss.reshape(-1)
             
         # Average the loss over the batch
         batch_loss = batch_loss / batch_size
@@ -345,7 +362,7 @@ if __name__ == "__main__":
     
     # Run training
     trained_model, history = train_qfm(
-        num_epochs=1_000, 
+        num_epochs=100, 
         batch_size=16,    # Average gradient over 8 random time samples per step
         lr=0.05, 
         N=5,             # 3 qubits (8-dimensional Hilbert space)
